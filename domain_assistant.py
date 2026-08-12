@@ -266,6 +266,59 @@ class OpenAIGenerator:
         return answer
 
 
+class GeminiGenerator:
+    """Text generator backed by the Google Gemini API."""
+
+    def __init__(self, max_output_tokens: int = 300) -> None:
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is missing from .env")
+        if not self.model:
+            raise RuntimeError("GEMINI_MODEL is missing from .env")
+        try:
+            from google import genai
+        except ImportError as exc:
+            raise RuntimeError(
+                "Gemini support is not installed. Run: python -m pip install -r requirements.txt"
+            ) from exc
+        self.client = genai.Client(api_key=api_key)
+        self.max_output_tokens = max_output_tokens
+
+    def generate(self, prompt: str) -> str:
+        # Free-tier Gemini keys may allow only a few requests per minute. The
+        # service includes a retry delay in 429 responses, so honor it instead
+        # of abandoning the complete 20-question benchmark.
+        from google.genai import errors
+
+        for attempt in range(5):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=prompt,
+                    config={
+                        "temperature": 0,
+                        "max_output_tokens": self.max_output_tokens,
+                    },
+                )
+                answer = (response.text or "").strip()
+                if not answer:
+                    raise RuntimeError("Gemini returned an empty answer")
+                return answer
+            except errors.ClientError as exc:
+                if getattr(exc, "code", None) != 429 or attempt == 4:
+                    raise
+                match = re.search(r"retry in\s+(\d+)", str(exc), re.IGNORECASE)
+                delay = int(match.group(1)) + 2 if match else 62
+                print(
+                    f"Gemini rate limit reached; waiting {delay}s before retrying...",
+                    flush=True,
+                )
+                time.sleep(delay)
+
+        raise RuntimeError("Gemini retry loop ended unexpectedly")
+
+
 @dataclass(frozen=True)
 class DomainResponse:
     question: str
@@ -296,10 +349,16 @@ class DomainAssistant:
         top_k: int = 5,
     ) -> DomainAssistant:
         corpus_id, chunks = load_corpus(corpus_dir)
+        if generator is None:
+            generator = (
+                GeminiGenerator()
+                if os.getenv("GEMINI_API_KEY", "").strip()
+                else OpenAIGenerator()
+            )
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator,
             top_k,
         )
 

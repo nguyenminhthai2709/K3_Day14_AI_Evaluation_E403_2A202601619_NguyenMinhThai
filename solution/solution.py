@@ -46,8 +46,7 @@ class EvalResult:
 
 class RAGASEvaluator:
     def evaluate_faithfulness(self, answer: str, context: str) -> float:
-        answer_tokens = _tokenize(answer)
-        return 1.0 if not answer_tokens else _overlap(_tokenize(context), answer_tokens)
+        return _overlap(_tokenize(answer), _tokenize(answer)) if not _tokenize(answer) else _overlap(_tokenize(context), _tokenize(answer))
 
     def evaluate_relevance(self, answer: str, question: str) -> float:
         return _overlap(_tokenize(answer), _tokenize(question))
@@ -108,7 +107,7 @@ class LLMJudge:
         self.judge_llm_fn = judge_llm_fn
 
     def score_response(self, question: str, answer: str, rubric: dict[str, Any]) -> dict[str, Any]:
-        prompt = f"Judge the answer against this rubric. Return JSON scores from 0 to 1.\nQuestion: {question}\nAnswer: {answer}\nRubric: {json.dumps(rubric)}"
+        prompt = f"Judge the answer against this rubric. Return a JSON object mapping each criterion to 0-1.\nQuestion: {question}\nAnswer: {answer}\nRubric: {json.dumps(rubric)}"
         reasoning = self.judge_llm_fn(prompt)
         defaults = {criterion: 0.5 for criterion in rubric}
         try:
@@ -120,7 +119,7 @@ class LLMJudge:
         return {"scores": scores, "reasoning": reasoning}
 
     def detect_bias(self, scores_batch: list[dict[str, Any]]) -> dict[str, Any]:
-        means = [sum(item["scores"].values()) / len(item["scores"]) for item in scores_batch if item.get("scores")]
+        means = [sum(item.get("scores", {}).values()) / len(item.get("scores", {})) for item in scores_batch if item.get("scores")]
         average = sum(means) / len(means) if means else 0.0
         positional = len(means) > 1 and means[0] > sum(means[1:]) / len(means[1:]) + 0.1
         return {"positional_bias": positional, "leniency_bias": average > 0.8, "severity_bias": average < 0.3}
@@ -148,18 +147,22 @@ class BenchmarkRunner:
                 "avg_relevance": average([r.relevance for r in results]) or 0.0,
                 "avg_completeness": average([r.completeness for r in results]) or 0.0,
                 "avg_context_recall": average([r.context_recall for r in results if r.context_recall is not None]),
-                "avg_context_precision": average([r.context_precision for r in results if r.context_precision is not None]), "failure_types": failure_types}
+                "avg_context_precision": average([r.context_precision for r in results if r.context_precision is not None]),
+                "failure_types": failure_types}
 
     def run_regression(self, new_results: list, baseline_results: list) -> dict:
-        def average(items: list, metric: str) -> float:
+        def avg(items: list, metric: str) -> float:
             return sum(getattr(item, metric) for item in items) / len(items) if items else 0.0
-        report, regressions = {}, []
+        report = {}
+        regressions = []
         for metric in ("faithfulness", "relevance", "completeness"):
-            new_value, baseline_value = average(new_results, metric), average(baseline_results, metric)
-            report[f"new_avg_{metric}"], report[f"baseline_avg_{metric}"] = new_value, baseline_value
-            if baseline_value - new_value > 0.05:
+            new_value, base_value = avg(new_results, metric), avg(baseline_results, metric)
+            report[f"new_avg_{metric}"] = new_value
+            report[f"baseline_avg_{metric}"] = base_value
+            if base_value - new_value > 0.05:
                 regressions.append(metric)
-        report["regressions"], report["passed"] = regressions, not regressions
+        report["regressions"] = regressions
+        report["passed"] = not regressions
         return report
 
     def identify_failures(self, results: list[EvalResult], threshold: float = 0.5) -> list[EvalResult]:
@@ -176,23 +179,21 @@ class FailureAnalyzer:
 
     def find_root_cause(self, failure: EvalResult) -> str:
         scores = {"faithfulness": failure.faithfulness, "relevance": failure.relevance, "completeness": failure.completeness}
-        lowest = min(scores, key=scores.get)
-        if list(scores.values()).count(scores[lowest]) > 1:
+        low = min(scores, key=scores.get)
+        if list(scores.values()).count(scores[low]) > 1:
             return "Multiple issues detected — review full pipeline"
-        return {"faithfulness": "Context is missing or irrelevant — improve retrieval", "relevance": "Answer does not address the question — improve prompt clarity", "completeness": "Answer is missing key information — increase context window or improve generation"}[lowest]
+        return {"faithfulness": "Context is missing or irrelevant — improve retrieval", "relevance": "Answer does not address the question — improve prompt clarity", "completeness": "Answer is missing key information — increase context window or improve generation"}[low]
 
     def generate_improvement_suggestions(self, failures: list[EvalResult]) -> list[str]:
         if not failures:
             return []
-        categories, suggestions = self.categorize_failures(failures), []
-        if any("hallucination" in key.lower() for key in categories):
-            suggestions.append("Add grounded-answer checks and retrieve evidence before generating claims.")
-        if any("irrelevant" in key.lower() or "off_topic" in key.lower() for key in categories):
-            suggestions.append("Clarify the routing prompt and add intent-specific examples.")
-        if any("incomplete" in key.lower() or "completeness" in key.lower() for key in categories):
-            suggestions.append("Retrieve more complementary chunks and require answers to cover each requested condition.")
+        categories = self.categorize_failures(failures)
+        options = []
+        if any("hallucination" in key.lower() for key in categories): options.append("Add grounded-answer checks and retrieve evidence before generating claims.")
+        if any("irrelevant" in key.lower() or "off_topic" in key.lower() for key in categories): options.append("Clarify the routing prompt and add intent-specific examples.")
+        if any("incomplete" in key.lower() or "completeness" in key.lower() for key in categories): options.append("Retrieve more complementary chunks and require answers to cover each requested condition.")
         defaults = ["Add regression cases for each observed failure before deploying a fix.", "Review low-scoring traces weekly and calibrate thresholds with human labels.", "Measure retrieval recall separately from generation quality."]
-        return (suggestions + defaults)[:max(3, len(suggestions))]
+        return (options + defaults)[:max(3, len(options))]
 
     def generate_improvement_log(self, failures: list, suggestions: list[str]) -> str:
         lines = ["| Failure ID | Type | Root Cause | Suggested Fix | Status |", "|------------|------|------------|---------------|--------|"]
